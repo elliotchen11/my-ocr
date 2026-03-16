@@ -1,0 +1,3 @@
+read the following document and extract values into the json schema.
+
+For all the requested items,  also return the sentence that contains the information required in the sentence source key.

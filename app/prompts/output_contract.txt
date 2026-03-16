@@ -1,0 +1,12 @@
+OUTPUT FORMAT: JSON only. No commentary.
+
+NORMALIZATION RULES:
+- Dates → ISO YYYY-MM-DD (if month/year only, use null; do NOT guess the day).
+- Numbers → plain numbers (no commas); currencies as “12345 CAD”.
+- Coordinates: accept variants (“WGS/WSG/WGS84”, “decimal”, “lat/long”, “UTM 10U/10N”).
+- Headings are messy: treat synonyms as matches.
+- If a section is explicitly “NA/Not applicable”, set it to "NA"; else prefer null.
+- Keep the bilingual header if present; tolerate minor OCR errors.
+
+If a field is absent, omit it or set null per the rules.
+<doc>\n{data}\n</doc>
