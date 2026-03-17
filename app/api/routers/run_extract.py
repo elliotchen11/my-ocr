@@ -11,8 +11,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.python.llm_extract_core import answer_questions_json, answer_questions_json_chunked
-from app.python.convert_to_img import convert_pdf2img
-from app.python.ocr import ocr_image, DEFAULT_PROMPT, DEFAULT_TIMEOUT, IMAGE_EXTS
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -85,19 +83,20 @@ def estimate_tokens(text: str) -> int:
 
 
 def normalize_answers(result: Any, questions: list[str]) -> dict[str, Any]:
+    """Normalize extraction result to {question: {value, confidence}} for all questions."""
+    null_entry: dict[str, Any] = {"value": None, "confidence": 0.0}
     if not isinstance(result, dict):
-        return {q: None for q in questions}
-    answers = result.get("answers") if isinstance(result.get("answers"), dict) else result
-    if not isinstance(answers, dict):
-        return {q: None for q in questions}
+        return {q: null_entry for q in questions}
     out: dict[str, Any] = {}
-    for i, q in enumerate(questions):
-        if q in answers:
-            out[q] = answers[q]
-        elif str(i) in answers:
-            out[q] = answers[str(i)]
+    for q in questions:
+        entry = result.get(q, null_entry)
+        if isinstance(entry, dict) and "value" in entry:
+            out[q] = {
+                "value": entry.get("value"),
+                "confidence": float(entry.get("confidence", 0.0)),
+            }
         else:
-            out[q] = None
+            out[q] = null_entry
     return out
 
 
@@ -123,83 +122,7 @@ def build_context_note(base: str, standard: dict | None, structure_text: str | N
     return "\n\n".join(parts).strip()
 
 
-# ---- Step functions ----
-
-def step_convert_to_img(pdf_path: Path, out_dir: Path, file_id: str, zoom: float = 2.0) -> list[str]:
-    """Convert a PDF to page images. Returns list of image paths."""
-    ensure_dir(out_dir)
-    return convert_pdf2img(
-        input_file=str(pdf_path),
-        out_dir=str(out_dir),
-        base_override=file_id,
-        zoom=zoom,
-    )
-
-
-def step_create_preview(
-    pdf_path: Path,
-    file_name: str,
-    preview_dir: Path,
-    file_id: str,
-) -> tuple[list[str], str | None]:
-    """
-    Generate preview images for a PDF file.
-    Returns (preview_paths, error_message).
-    """
-    if not pdf_path.is_file() or not file_name.lower().endswith(".pdf"):
-        return [], None
-    try:
-        preview_paths = step_convert_to_img(pdf_path, preview_dir, file_id)
-        return preview_paths, None
-    except Exception as e:
-        return [], f"preview generation failed — {e}"
-
-
-def step_ocr(
-    pdf_path: Path,
-    preview_paths: list[str],
-    text_path: Path,
-    ocr_model: str,
-    ocr_prompt: str,
-    ocr_timeout: float,
-) -> list[str]:
-    """
-    Run OCR on preview images (PDF) or the file directly (image).
-    Writes text to text_path incrementally (one page at a time).
-    Returns list of per-page error messages.
-    Skips if text_path already exists.
-    """
-    if text_path.is_file():
-        return []
-
-    images_to_ocr: list[str] = []
-    if preview_paths:
-        images_to_ocr = preview_paths
-    elif pdf_path.is_file() and pdf_path.suffix.lower() in IMAGE_EXTS:
-        images_to_ocr = [str(pdf_path)]
-
-    if not images_to_ocr:
-        return []
-
-    ensure_dir(text_path.parent)
-    ocr_errors: list[str] = []
-    with text_path.open("w", encoding="utf-8") as fh:
-        for i, img_path in enumerate(images_to_ocr, start=1):
-            try:
-                page_text = ocr_image(
-                    model=ocr_model,
-                    image_path=Path(img_path),
-                    prompt=ocr_prompt,
-                    timeout=ocr_timeout,
-                ).strip()
-                fh.write(f"===== PAGE {i} =====\n{page_text}\n\n")
-                fh.flush()
-            except Exception as e:
-                ocr_errors.append(f"page {i} ({img_path}): {e}")
-                fh.write(f"===== PAGE {i} OCR FAILED =====\n{e}\n\n")
-                fh.flush()
-    return ocr_errors
-
+# ---- Step function ----
 
 def step_extraction(
     doc_text: str,
@@ -245,9 +168,6 @@ class RunExtractRequest(BaseModel):
     project_id: str
     file_ids: list[str]
     model: str = "gpt-oss"
-    ocr_model: str = "mistral-small3.2"
-    ocr_prompt: str = DEFAULT_PROMPT
-    ocr_timeout: float = DEFAULT_TIMEOUT
     standard_id: str | None = None
     structure_name: str | None = None
     context_note: str = ""
@@ -322,38 +242,17 @@ def run_extract(body: RunExtractRequest):
         for fid in body.file_ids:
             file_record = file_index[fid]
             file_name = file_record.get("fileName", "")
-            pdf_path = root / "files" / file_name
-
-            # Step 1: generate preview images (also used for OCR)
-            append_audit(audit_path, {"ts": now_iso(), "action": "start step_create_preview", "project_id": body.project_id, "file_id": fid})
-            preview_paths, preview_err = step_create_preview(
-                pdf_path=pdf_path,
-                file_name=file_name,
-                preview_dir=root / "previews" / fid,
-                file_id=fid,
-            )
-            if preview_err:
-                errors.append(f"{fid}: {preview_err}")
-            append_audit(audit_path, {"ts": now_iso(), "action": "complete step_create_preview", "project_id": body.project_id, "file_id": fid, "preview_count": len(preview_paths), "error": preview_err})
-
-            # Step 2: OCR images → text file
             text_path = root / "text" / f"{fid}.txt"
-            append_audit(audit_path, {"ts": now_iso(), "action": "start step_ocr", "project_id": body.project_id, "file_id": fid})
-            ocr_errs = step_ocr(
-                pdf_path=pdf_path,
-                preview_paths=preview_paths,
-                text_path=text_path,
-                ocr_model=body.ocr_model,
-                ocr_prompt=body.ocr_prompt,
-                ocr_timeout=body.ocr_timeout,
-            )
-            if ocr_errs:
-                errors.extend(f"{fid}: OCR — {e}" for e in ocr_errs)
-            append_audit(audit_path, {"ts": now_iso(), "action": "complete step_ocr", "project_id": body.project_id, "file_id": fid, "status": "failed" if ocr_errs else "successful", "errors": ocr_errs})
+            preview_paths: list[str] = []
+
+            # Collect existing preview paths if available
+            preview_dir = root / "previews" / fid
+            if preview_dir.is_dir():
+                preview_paths = sorted(str(p) for p in preview_dir.iterdir() if p.suffix.lower() == ".png")
 
             if not text_path.is_file():
-                run_record["outputs"][fid] = {q: None for q in questions}
-                errors.append(f"{fid}: no text layer found at {text_path}")
+                run_record["outputs"][fid] = {q: {"value": None, "confidence": 0.0} for q in questions}
+                errors.append(f"{fid}: no text layer found — run OCR first via POST /api/ocr")
                 run_record["files"].append({
                     "file_id": fid,
                     "fileName": file_name,
@@ -364,7 +263,7 @@ def run_extract(body: RunExtractRequest):
                 })
                 continue
 
-            # Step 3: extract fields from text
+            # Extract fields from text
             doc_text = text_path.read_text(encoding="utf-8", errors="replace")
             tok_est = estimate_tokens(doc_text)
             append_audit(audit_path, {"ts": now_iso(), "action": "start step_extraction", "project_id": body.project_id, "file_id": fid})
@@ -381,7 +280,7 @@ def run_extract(body: RunExtractRequest):
                 )
             except Exception as e:
                 append_audit(audit_path, {"ts": now_iso(), "action": "complete step_extraction", "project_id": body.project_id, "file_id": fid, "status": "failed", "error": str(e)})
-                run_record["outputs"][fid] = {q: None for q in questions}
+                run_record["outputs"][fid] = {q: {"value": None, "confidence": 0.0} for q in questions}
                 errors.append(f"{fid}: extraction failed — {e}")
                 run_record["files"].append({
                     "file_id": fid,
