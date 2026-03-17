@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import json
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+import httpx
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -147,14 +149,100 @@ class RunOCRRequest(BaseModel):
     ocr_prompt: str = DEFAULT_PROMPT
     ocr_timeout: float = DEFAULT_TIMEOUT
     force_rerun: bool = False
+    callback: str | None = None  # Full URL (http/https) to POST results to when done
+
+    from pydantic import field_validator
+
+    @field_validator("callback")
+    @classmethod
+    def callback_must_be_absolute(cls, v: str | None) -> str | None:
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError("callback must be an absolute URL starting with http:// or https://")
+        return v
+
+
+# ---- Background worker ----
+
+def _run_ocr_job(job_id: str, body: RunOCRRequest) -> None:
+    root = DATA_ROOT / body.project_id
+    audit_path = root / "audit.json"
+
+    manifest = read_json(root / "project.json", {})
+    file_index = {f["id"]: f for f in manifest.get("files", []) if f.get("id")}
+
+    results: list[dict] = []
+
+    for fid in body.file_ids:
+        file_record = file_index.get(fid)
+        if not file_record:
+            results.append({"project_id": body.project_id, "file_id": fid, "error": "file not found"})
+            continue
+
+        file_name = file_record.get("fileName", "")
+        pdf_path = root / "files" / file_name
+        text_path = root / "text" / f"{fid}.txt"
+
+        if body.force_rerun and text_path.is_file():
+            text_path.unlink()
+
+        append_audit(audit_path, {"ts": now_iso(), "action": "start step_create_preview", "job_id": job_id, "project_id": body.project_id, "file_id": fid})
+        preview_paths, preview_err = step_create_preview(
+            pdf_path=pdf_path,
+            file_name=file_name,
+            preview_dir=root / "previews" / fid,
+            file_id=fid,
+        )
+        append_audit(audit_path, {"ts": now_iso(), "action": "complete step_create_preview", "job_id": job_id, "project_id": body.project_id, "file_id": fid, "preview_count": len(preview_paths), "error": preview_err})
+
+        skipped = text_path.is_file()
+        append_audit(audit_path, {"ts": now_iso(), "action": "start step_ocr", "job_id": job_id, "project_id": body.project_id, "file_id": fid, "skipped": skipped})
+        ocr_errs = step_ocr(
+            pdf_path=pdf_path,
+            preview_paths=preview_paths,
+            text_path=text_path,
+            ocr_model=body.ocr_model,
+            ocr_prompt=body.ocr_prompt,
+            ocr_timeout=body.ocr_timeout,
+        )
+        append_audit(audit_path, {"ts": now_iso(), "action": "complete step_ocr", "job_id": job_id, "project_id": body.project_id, "file_id": fid, "skipped": skipped, "status": "failed" if ocr_errs else "successful", "errors": ocr_errs})
+
+        file_contents: list[dict] = []
+        if text_path.is_file():
+            file_contents.append({
+                "contentType": "text/plain",
+                "contentBase64": base64.b64encode(text_path.read_bytes()).decode("utf-8"),
+            })
+        for preview_path in preview_paths:
+            p = Path(preview_path)
+            if p.is_file():
+                file_contents.append({
+                    "contentType": "image/png",
+                    "contentBase64": base64.b64encode(p.read_bytes()).decode("utf-8"),
+                })
+
+        results.append({
+            "project_id": body.project_id,
+            "file_id": fid,
+            "ocr_skipped": skipped,
+            "ocr_errors": ocr_errs,
+            "preview_error": preview_err,
+            "files": file_contents,
+        })
+
+    if body.callback:
+        payload = {"job_id": job_id, "status": "completed", "results": results}
+        try:
+            with httpx.Client(timeout=30) as client:
+                client.post(body.callback, json=payload)
+        except Exception as e:
+            append_audit(audit_path, {"ts": now_iso(), "action": "callback_failed", "job_id": job_id, "project_id": body.project_id, "error": str(e)})
 
 
 # ---- Endpoint ----
 
 @router.post("")
-def run_ocr(body: RunOCRRequest):
+def run_ocr(body: RunOCRRequest, background_tasks: BackgroundTasks):
     root = get_project_root(body.project_id)
-    audit_path = root / "audit.json"
 
     manifest = read_json(root / "project.json", {})
     file_index = {f["id"]: f for f in manifest.get("files", []) if f.get("id")}
@@ -163,7 +251,16 @@ def run_ocr(body: RunOCRRequest):
     if missing:
         raise HTTPException(status_code=404, detail=f"File IDs not found in project: {missing}")
 
+    # If a callback URL is provided, run in background and return immediately
+    if body.callback:
+        job_id = str(uuid.uuid4())
+        background_tasks.add_task(_run_ocr_job, job_id, body)
+        return JSONResponse(content={"job_id": job_id, "status": "queued"})
+
+    # No callback — run synchronously and return results directly
+    job_id = str(uuid.uuid4())
     results: list[dict] = []
+    audit_path = root / "audit.json"
 
     for fid in body.file_ids:
         file_record = file_index[fid]
@@ -171,11 +268,9 @@ def run_ocr(body: RunOCRRequest):
         pdf_path = root / "files" / file_name
         text_path = root / "text" / f"{fid}.txt"
 
-        # If force_rerun, delete existing text so OCR re-runs
         if body.force_rerun and text_path.is_file():
             text_path.unlink()
 
-        # Step 1: generate preview images
         append_audit(audit_path, {"ts": now_iso(), "action": "start step_create_preview", "project_id": body.project_id, "file_id": fid})
         preview_paths, preview_err = step_create_preview(
             pdf_path=pdf_path,
@@ -185,7 +280,6 @@ def run_ocr(body: RunOCRRequest):
         )
         append_audit(audit_path, {"ts": now_iso(), "action": "complete step_create_preview", "project_id": body.project_id, "file_id": fid, "preview_count": len(preview_paths), "error": preview_err})
 
-        # Step 2: OCR images → text file
         skipped = text_path.is_file()
         append_audit(audit_path, {"ts": now_iso(), "action": "start step_ocr", "project_id": body.project_id, "file_id": fid, "skipped": skipped})
         ocr_errs = step_ocr(
@@ -199,13 +293,11 @@ def run_ocr(body: RunOCRRequest):
         append_audit(audit_path, {"ts": now_iso(), "action": "complete step_ocr", "project_id": body.project_id, "file_id": fid, "skipped": skipped, "status": "failed" if ocr_errs else "successful", "errors": ocr_errs})
 
         file_contents: list[dict] = []
-
         if text_path.is_file():
             file_contents.append({
                 "contentType": "text/plain",
                 "contentBase64": base64.b64encode(text_path.read_bytes()).decode("utf-8"),
             })
-
         for preview_path in preview_paths:
             p = Path(preview_path)
             if p.is_file():
