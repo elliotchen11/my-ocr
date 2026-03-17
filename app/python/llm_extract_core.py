@@ -20,14 +20,15 @@ You will receive:
 Return ONLY valid JSON, and ONLY this structure:
 {
   "answers": {
-    "<id>": <string or null>,
+    "<id>": {"value": <string or null>, "confidence": <float 0.0-1.0>},
     ...
   }
 }
 
 Rules:
 - Use only evidence from the document text.
-- If not present / not inferable, use null.
+- If not present / not inferable, set value to null and confidence to 0.0.
+- confidence is your certainty that the extracted value is correct (0.0 = no evidence, 1.0 = exact match found).
 - Do not add extra keys.
 - No markdown, no explanation.
 """
@@ -111,6 +112,30 @@ def _normalize_question_for_model(q: str) -> str:
     return q2
 
 
+def _extract_field(raw: Any) -> Dict[str, Any]:
+    """Normalize a single answer entry to {value, confidence}."""
+    if isinstance(raw, dict):
+        value = raw.get("value")
+        confidence = raw.get("confidence", 0.0)
+    else:
+        # Old-style plain string answer — treat as full confidence if non-null
+        value = raw
+        confidence = 0.0 if raw is None else 1.0
+
+    if isinstance(value, str):
+        value = value.strip() or None
+    elif value is not None:
+        value = str(value).strip() or None
+
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    return {"value": value, "confidence": confidence}
+
+
 def answer_questions_json(
     *,
     model: str,
@@ -119,9 +144,9 @@ def answer_questions_json(
     context_note: str = "The information might be spread out through the entire document.",
     temperature: float = 0.1,
     timeout: float = DEFAULT_TIMEOUT,
-) -> Dict[str, Optional[str]]:
+) -> Dict[str, Dict[str, Any]]:
     orig_questions = [q.strip() for q in questions if q and q.strip()]
-    
+
     if not orig_questions:
         return {}
 
@@ -157,48 +182,24 @@ def answer_questions_json(
         parsed = _repair_to_json(model, content, timeout=timeout)
 
     # --- flexible answer extraction ---
-    answers = None
+    answers: Dict[str, Any] = {}
 
     if isinstance(parsed, dict):
-        # Preferred: {"answers": {"q1": "..."}}
         if isinstance(parsed.get("answers"), dict):
             answers = parsed["answers"]
-
-        # Common: {"q1": "..."} (no wrapper)
         elif any(k.startswith("q") and k[1:].isdigit() for k in parsed.keys()):
             answers = parsed
 
-        # Also common: keys are the human questions themselves
-        else:
-            answers = {}
-
-    if not isinstance(answers, dict):
-        answers = {}
-
-
     # Remap back to the original question strings as keys.
-    out: Dict[str, Optional[str]] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for qid, key in id_to_key.items():
-        v = None
+        raw = answers.get(qid)
+        if raw is None:
+            raw = answers.get(id_to_key[qid])
+        if raw is None:
+            raw = answers.get(id_to_key[qid].rstrip(":").strip())
+        out[key] = _extract_field(raw)
 
-        # Preferred: id-based
-        if isinstance(answers, dict):
-            v = answers.get(qid, None)
-
-            # Fallback: original question string
-            if v is None:
-                orig_key = id_to_key[qid]
-                v = answers.get(orig_key, None)
-
-            # Fallback: stripped colon
-            if v is None:
-                v = answers.get(orig_key.rstrip(":").strip(), None)
-
-        # Normalize final value
-        if v is None:
-            out[key] = None
-        else:
-            out[key] = str(v).strip() if str(v).strip() else None
     return out
 
 
@@ -224,12 +225,12 @@ def answer_questions_json_chunked(
     max_chars: int = 12000,
     overlap: int = 800,
     timeout: float = DEFAULT_TIMEOUT,
-) -> Dict[str, Optional[str]]:
+) -> Dict[str, Dict[str, Any]]:
     qs = [q.strip() for q in questions if q and q.strip()]
     if not qs:
         return {}
 
-    merged: Dict[str, Optional[str]] = {q: None for q in qs}
+    merged: Dict[str, Dict[str, Any]] = {q: {"value": None, "confidence": 0.0} for q in qs}
     chunks = _chunk_text(document_text, max_chars=max_chars, overlap=overlap)
 
     for idx, ch in enumerate(chunks, start=1):
@@ -242,16 +243,9 @@ def answer_questions_json_chunked(
             timeout=timeout,
         )
         for q in qs:
-            new_v = partial.get(q)
-            old_v = merged.get(q)
-
-            def _score(v: Optional[str]) -> int:
-                if not v:
-                    return 0
-                return len(v.strip())
-
-            if _score(new_v) > _score(old_v):
-                merged[q] = new_v
+            new_entry = partial.get(q, {"value": None, "confidence": 0.0})
+            if new_entry.get("confidence", 0.0) > merged[q].get("confidence", 0.0):
+                merged[q] = new_entry
 
     return merged
 
