@@ -164,12 +164,28 @@ def step_extraction(
 
 # ---- Request model ----
 
+class StandardField(BaseModel):
+    field: str = ""
+    fieldName: str = ""
+    definition: str = ""
+    description: str = ""
+    dataType: str = ""
+    required: bool = False
+    format: str = ""
+    allowed_values: str = ""
+
+
+class StandardSchema(BaseModel):
+    fields: list[StandardField] = []
+    version: int | None = None
+
+
 class RunExtractRequest(BaseModel):
     project_id: str
     file_ids: list[str]
     model: str = "gpt-oss"
-    standard_id: str | None = None
-    structure_name: str | None = None
+    standard: StandardSchema | None = None  # Inline standard JSON (same schema as standard_v1.json)
+    structure: str | None = None  # Direct text content of the structure file
     context_note: str = ""
     force_chunking: bool = False
     token_threshold: int = TOKEN_THRESHOLD
@@ -192,19 +208,9 @@ def run_extract(body: RunExtractRequest):
         if missing:
             raise HTTPException(status_code=404, detail=f"File IDs not found in project: {missing}")
 
-        standard: dict | None = None
-        if body.standard_id:
-            std_path = root / "data_standards" / f"{body.standard_id}.json"
-            if not std_path.is_file():
-                raise HTTPException(status_code=404, detail=f"Standard not found: {body.standard_id}")
-            standard = read_json(std_path, {})
+        standard: dict | None = body.standard.model_dump() if body.standard else None
 
-        structure_text: str | None = None
-        if body.structure_name:
-            struct_path = root / "structures" / body.structure_name
-            if not struct_path.is_file():
-                raise HTTPException(status_code=404, detail=f"Structure not found: {body.structure_name}")
-            structure_text = struct_path.read_text(encoding="utf-8")
+        structure_text: str | None = body.structure
 
         questions: list[str] = []
         if standard and isinstance(standard.get("fields"), list):
@@ -225,8 +231,8 @@ def run_extract(body: RunExtractRequest):
             "project_id": body.project_id,
             "model": body.model,
             "context_note": ctx_full,
-            "standard_id": body.standard_id,
-            "structure_name": body.structure_name,
+            "standard": body.standard.model_dump() if body.standard else None,
+            "structure": body.structure,
             "files": [],
             "outputs": {},
             "params": {
@@ -322,7 +328,19 @@ def run_extract(body: RunExtractRequest):
             "status": "successful",
         })
 
-        return JSONResponse(content=run_record)
+        flat_outputs = [
+            {"question": q, "answer": v["value"], "confidence": v["confidence"]}
+            for answers in run_record["outputs"].values()
+            for q, v in answers.items()
+        ]
+
+        return JSONResponse(content={
+            "run_id": run_id,
+            "project_id": body.project_id,
+            "model": body.model,
+            "file_ids": body.file_ids,
+            "outputs": flat_outputs,
+        })
 
     except Exception as e:
         append_audit(audit_path, {
